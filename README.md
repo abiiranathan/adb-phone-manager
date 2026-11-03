@@ -5,6 +5,8 @@ device through Android Debug Bridge (ADB). It is written in Rust and uses
 [egui](https://github.com/emilk/egui) for its graphical interface. Device
 operations run in the background so the interface remains responsive.
 
+![Scrrenshot](./screenshot.png)
+
 ## Features
 
 - **Calls:** view recent call history, place calls, answer ringing calls, and
