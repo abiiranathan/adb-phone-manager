@@ -1,0 +1,14 @@
+[package]
+name = "adb-phone-manager"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "egui front end for browsing and controlling an Android phone over adb"
+
+[dependencies]
+eframe = "0.31"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+lto = "thin"
+strip = true
