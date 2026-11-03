@@ -18,6 +18,7 @@ for size in 16 24 32 48 64 128 256 512; do
         "$root/assets/icons/hicolor/${size}x${size}/apps/adb-phone-manager.png" \
         "$data_home/icons/hicolor/${size}x${size}/apps/adb-phone-manager.png"
 done
+
 install -Dm644 "$root/assets/adb-phone-manager.svg" \
     "$data_home/icons/hicolor/scalable/apps/adb-phone-manager.svg"
 
