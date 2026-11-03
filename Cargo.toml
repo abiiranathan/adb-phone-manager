@@ -8,6 +8,7 @@ description = "egui front end for browsing and controlling an Android phone over
 [dependencies]
 eframe = "0.31"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+egui_extras = { version = "0.31", default-features = false }
 
 [profile.release]
 lto = "thin"

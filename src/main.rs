@@ -6,6 +6,7 @@ mod worker;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
+use egui_extras::{Column, TableBuilder};
 
 use crate::adb::{
     join_remote, parent_dir, parse_text_segments, path_segments, CallRecord, CallState, CallType,
@@ -278,6 +279,31 @@ fn configure_style(ctx: &egui::Context) {
 /// Adds a row action button: full button padding, but capped to fit a table row.
 fn row_button(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>) -> egui::Response {
     ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, 22.0)))
+}
+
+/// Builds a `Name (number)` label with the name emphasised and the number muted.
+fn caller_label(ui: &egui::Ui, name: &str, number: &str) -> egui::text::LayoutJob {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        name,
+        0.0,
+        egui::TextFormat {
+            font_id: font_id.clone(),
+            color: ui.visuals().strong_text_color(),
+            ..Default::default()
+        },
+    );
+    job.append(
+        &format!(" ({number})"),
+        0.0,
+        egui::TextFormat {
+            font_id,
+            color: ui.visuals().weak_text_color(),
+            ..Default::default()
+        },
+    );
+    job
 }
 
 /// Application state. Lives on the UI thread only.
@@ -730,71 +756,41 @@ impl PhoneApp {
             })
             .collect();
 
-        let col_type = 90.0;
-        let col_date = 140.0;
-        let col_dur = 80.0;
-        let col_act = 170.0;
-        let row_height = ROW_HEIGHT;
-        let col_caller =
-            (ui.available_width() - (col_type + col_date + col_dur + col_act + 40.0)).max(160.0);
-
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_type, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Type");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_caller, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Caller / Number");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_date, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Date");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_dur, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Duration");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_act, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Actions");
-                },
-            );
-        });
-        ui.separator();
-
         let mut dial_number: Option<String> = None;
         let mut copy_text: Option<String> = None;
 
-        egui::ScrollArea::vertical()
+        TableBuilder::new(ui)
+            .id_salt("calls_table")
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, false])
-            .show_rows(ui, row_height, visible.len(), |ui, range| {
-                for (i, call) in visible[range.clone()].iter().enumerate() {
-                    let actual_idx = range.start + i;
-                    let row_rect = egui::Rect::from_min_size(
-                        ui.cursor().min,
-                        egui::vec2(ui.available_width(), row_height),
-                    );
-                    if actual_idx % 2 == 1 {
-                        ui.painter()
-                            .rect_filled(row_rect, 2.0, ui.visuals().faint_bg_color);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.set_height(row_height);
+            .column(Column::initial(100.0).at_least(85.0))
+            .column(Column::remainder().at_least(160.0).clip(true))
+            .column(Column::initial(150.0).at_least(130.0))
+            .column(Column::initial(90.0).at_least(75.0))
+            .column(Column::initial(190.0).at_least(170.0))
+            .header(26.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Type");
+                });
+                header.col(|ui| {
+                    ui.strong("Caller / Number");
+                });
+                header.col(|ui| {
+                    ui.strong("Date");
+                });
+                header.col(|ui| {
+                    ui.strong("Duration");
+                });
+                header.col(|ui| {
+                    ui.strong("Actions");
+                });
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, visible.len(), |mut row| {
+                    let call = visible[row.index()];
+                    row.col(|ui| {
                         let (type_color, type_label) = match call.call_type {
                             CallType::Incoming => (Color32::LIGHT_GREEN, call.call_type.label()),
                             CallType::Outgoing => {
@@ -807,68 +803,46 @@ impl PhoneApp {
                                 (Color32::GRAY, call.call_type.label())
                             }
                         };
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_type, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.label(RichText::new(type_label).color(type_color).strong());
-                            },
-                        );
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_caller, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if call.name.is_empty() {
-                                    ui.add(
-                                        egui::Label::new(RichText::new(&call.number).monospace())
-                                            .selectable(true),
-                                    );
-                                } else {
-                                    ui.label(RichText::new(&call.name).strong());
-                                    ui.weak(format!("({})", call.number));
-                                }
-                            },
-                        );
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_date, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.label(format_timestamp(call.date_ms));
-                            },
-                        );
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_dur, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.label(format_duration(call.duration_secs));
-                            },
-                        );
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_act, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if !call.number.is_empty() {
-                                    if row_button(ui, "📞 Call")
-                                        .on_hover_text("Call this number")
-                                        .clicked()
-                                    {
-                                        dial_number = Some(call.number.clone());
-                                    }
-                                    if row_button(ui, "📋 Copy")
-                                        .on_hover_text("Copy number")
-                                        .clicked()
-                                    {
-                                        copy_text = Some(call.number.clone());
-                                    }
-                                }
-                            },
-                        );
+                        ui.label(RichText::new(type_label).color(type_color).strong());
                     });
-                }
+                    row.col(|ui| {
+                        if call.name.is_empty() {
+                            ui.add(
+                                egui::Label::new(RichText::new(&call.number).monospace())
+                                    .selectable(true)
+                                    .truncate(),
+                            );
+                        } else {
+                            ui.add(
+                                egui::Label::new(caller_label(ui, &call.name, &call.number))
+                                    .selectable(true)
+                                    .truncate(),
+                            );
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(format_timestamp(call.date_ms));
+                    });
+                    row.col(|ui| {
+                        ui.label(format_duration(call.duration_secs));
+                    });
+                    row.col(|ui| {
+                        if !call.number.is_empty() {
+                            if row_button(ui, "📞 Call")
+                                .on_hover_text("Call this number")
+                                .clicked()
+                            {
+                                dial_number = Some(call.number.clone());
+                            }
+                            if row_button(ui, "📋 Copy")
+                                .on_hover_text("Copy number")
+                                .clicked()
+                            {
+                                copy_text = Some(call.number.clone());
+                            }
+                        }
+                    });
+                });
             });
 
         if let Some(number) = dial_number {
@@ -1025,94 +999,61 @@ impl PhoneApp {
             })
             .collect();
 
-        let row_height = ROW_HEIGHT;
-        let col_num = 180.0;
-        let col_act = 170.0;
-        let col_name = (ui.available_width() - (col_num + col_act + 40.0)).max(180.0);
-
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_name, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Name");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_num, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Phone Number");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_act, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Actions");
-                },
-            );
-        });
-        ui.separator();
-
         let mut dial_number: Option<String> = None;
         let mut copy_text: Option<String> = None;
 
-        egui::ScrollArea::vertical()
+        TableBuilder::new(ui)
+            .id_salt("contacts_table")
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, false])
-            .show_rows(ui, row_height, visible.len(), |ui, range| {
-                for (i, contact) in visible[range.clone()].iter().enumerate() {
-                    let actual_idx = range.start + i;
-                    let row_rect = egui::Rect::from_min_size(
-                        ui.cursor().min,
-                        egui::vec2(ui.available_width(), row_height),
-                    );
-                    if actual_idx % 2 == 1 {
-                        ui.painter()
-                            .rect_filled(row_rect, 2.0, ui.visuals().faint_bg_color);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.set_height(row_height);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_name, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(RichText::new(&contact.name).strong())
-                                        .selectable(true),
-                                );
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_num, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(RichText::new(&contact.number).monospace())
-                                        .selectable(true),
-                                );
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_act, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if row_button(ui, "📞 Call")
-                                    .on_hover_text("Dial this number")
-                                    .clicked()
-                                {
-                                    dial_number = Some(contact.number.clone());
-                                }
-                                if row_button(ui, "📋 Copy")
-                                    .on_hover_text("Copy phone number")
-                                    .clicked()
-                                {
-                                    copy_text = Some(contact.number.clone());
-                                }
-                            },
+            .column(Column::remainder().at_least(180.0).clip(true))
+            .column(Column::initial(190.0).at_least(160.0))
+            .column(Column::initial(190.0).at_least(170.0))
+            .header(26.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Name");
+                });
+                header.col(|ui| {
+                    ui.strong("Phone Number");
+                });
+                header.col(|ui| {
+                    ui.strong("Actions");
+                });
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, visible.len(), |mut row| {
+                    let contact = visible[row.index()];
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&contact.name).strong())
+                                .selectable(true)
+                                .truncate(),
                         );
                     });
-                }
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&contact.number).monospace())
+                                .selectable(true)
+                                .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        if row_button(ui, "📞 Call")
+                            .on_hover_text("Dial this number")
+                            .clicked()
+                        {
+                            dial_number = Some(contact.number.clone());
+                        }
+                        if row_button(ui, "📋 Copy")
+                            .on_hover_text("Copy phone number")
+                            .clicked()
+                        {
+                            copy_text = Some(contact.number.clone());
+                        }
+                    });
+                });
             });
 
         if let Some(number) = dial_number {
@@ -1161,111 +1102,78 @@ impl PhoneApp {
             })
             .collect();
 
-        let row_height = ROW_HEIGHT;
-        let col_act = 380.0;
-        let col_name = 180.0;
-        let col_pkg = (ui.available_width() - (col_name + col_act + 40.0)).max(220.0);
-
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_name, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("App Name");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_pkg, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Package ID");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_act, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Actions");
-                },
-            );
-        });
-        ui.separator();
-
         let mut action: Option<AppAction> = None;
         let mut copy_pkg: Option<String> = None;
 
-        egui::ScrollArea::vertical()
+        TableBuilder::new(ui)
+            .id_salt("apps_table")
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, false])
-            .show_rows(ui, row_height, visible.len(), |ui, range| {
-                for (i, (package, name)) in visible[range.clone()].iter().enumerate() {
-                    let actual_idx = range.start + i;
-                    let row_rect = egui::Rect::from_min_size(
-                        ui.cursor().min,
-                        egui::vec2(ui.available_width(), row_height),
-                    );
-                    if actual_idx % 2 == 1 {
-                        ui.painter()
-                            .rect_filled(row_rect, 2.0, ui.visuals().faint_bg_color);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.set_height(row_height);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_name, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(RichText::new(name).strong()).selectable(true),
-                                );
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_pkg, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(RichText::new(package.as_str()).monospace())
-                                        .selectable(true),
-                                );
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_act, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if row_button(ui, "▶ Launch")
-                                    .on_hover_text("Launch app")
-                                    .clicked()
-                                {
-                                    action = Some(AppAction::Launch((*package).clone()));
-                                }
-                                if row_button(ui, "⏹ Stop")
-                                    .on_hover_text("Force stop app")
-                                    .clicked()
-                                {
-                                    action = Some(AppAction::Stop((*package).clone()));
-                                }
-                                if row_button(
-                                    ui,
-                                    RichText::new("🗑 Uninstall")
-                                        .color(ui.visuals().error_fg_color),
-                                )
-                                .on_hover_text(
-                                    "Uninstall this app (system apps are removed for the primary user)",
-                                )
-                                .clicked()
-                                {
-                                    action = Some(AppAction::Uninstall((*package).clone()));
-                                }
-                                if row_button(ui, "📋 Copy")
-                                    .on_hover_text("Copy package name")
-                                    .clicked()
-                                {
-                                    copy_pkg = Some((*package).clone());
-                                }
-                            },
+            .column(Column::initial(200.0).at_least(160.0).clip(true))
+            .column(Column::remainder().at_least(220.0).clip(true))
+            .column(Column::initial(390.0).at_least(360.0))
+            .header(26.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("App Name");
+                });
+                header.col(|ui| {
+                    ui.strong("Package ID");
+                });
+                header.col(|ui| {
+                    ui.strong("Actions");
+                });
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, visible.len(), |mut row| {
+                    let (package, name) = &visible[row.index()];
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(name).strong())
+                                .selectable(true)
+                                .truncate(),
                         );
                     });
-                }
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(package.as_str()).monospace())
+                                .selectable(true)
+                                .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        if row_button(ui, "▶ Launch")
+                            .on_hover_text("Launch app")
+                            .clicked()
+                        {
+                            action = Some(AppAction::Launch((*package).clone()));
+                        }
+                        if row_button(ui, "⏹ Stop")
+                            .on_hover_text("Force stop app")
+                            .clicked()
+                        {
+                            action = Some(AppAction::Stop((*package).clone()));
+                        }
+                        if row_button(
+                            ui,
+                            RichText::new("🗑 Uninstall").color(ui.visuals().error_fg_color),
+                        )
+                        .on_hover_text(
+                            "Uninstall this app (system apps are removed for the primary user)",
+                        )
+                        .clicked()
+                        {
+                            action = Some(AppAction::Uninstall((*package).clone()));
+                        }
+                        if row_button(ui, "📋 Copy")
+                            .on_hover_text("Copy package name")
+                            .clicked()
+                        {
+                            copy_pkg = Some((*package).clone());
+                        }
+                    });
+                });
             });
 
         match action {
@@ -1424,154 +1332,111 @@ impl PhoneApp {
         ui.separator();
 
         let dir_for_rows = current_dir.clone().unwrap_or_default();
-        let row_height = ROW_HEIGHT;
-        let col_size = 90.0;
-        let col_date = 140.0;
-        let col_act = 260.0;
-        let col_name = (ui.available_width() - (col_size + col_date + col_act + 40.0)).max(200.0);
 
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_name, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Name");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_size, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Size");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_date, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Modified");
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(col_act, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.strong("Actions");
-                },
-            );
-        });
-        ui.separator();
-
-        egui::ScrollArea::vertical()
+        TableBuilder::new(ui)
+            .id_salt("files_table")
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, false])
-            .show_rows(ui, row_height, visible.len(), |ui, range| {
-                for (i, entry) in visible[range.clone()].iter().enumerate() {
-                    let actual_idx = range.start + i;
+            .column(Column::remainder().at_least(200.0).clip(true))
+            .column(Column::initial(100.0).at_least(85.0))
+            .column(Column::initial(160.0).at_least(140.0))
+            .column(Column::initial(280.0).at_least(260.0))
+            .header(26.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Name");
+                });
+                header.col(|ui| {
+                    ui.strong("Size");
+                });
+                header.col(|ui| {
+                    ui.strong("Modified");
+                });
+                header.col(|ui| {
+                    ui.strong("Actions");
+                });
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, visible.len(), |mut row| {
+                    let entry = visible[row.index()];
                     let path = join_remote(&dir_for_rows, &entry.name);
-                    let row_rect = egui::Rect::from_min_size(
-                        ui.cursor().min,
-                        egui::vec2(ui.available_width(), row_height),
-                    );
-                    if actual_idx % 2 == 1 {
-                        ui.painter()
-                            .rect_filled(row_rect, 2.0, ui.visuals().faint_bg_color);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.set_height(row_height);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_name, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| match entry.kind {
-                                EntryKind::Directory => {
-                                    let response = ui
-                                        .add(
-                                            egui::Label::new(
-                                                RichText::new(format!("📁 {}", entry.name))
-                                                    .strong(),
-                                            )
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                    if response.clicked() {
-                                        action = Some(FileAction::Browse(path.clone()));
-                                    }
-                                }
-                                EntryKind::File => {
-                                    let response = ui
-                                        .add(
-                                            egui::Label::new(format!("📄 {}", entry.name))
-                                                .truncate()
-                                                .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_text("Double-click to open");
-                                    if response.double_clicked() {
-                                        action = Some(FileAction::Open(path.clone()));
-                                    }
-                                }
-                                EntryKind::Other => {
-                                    ui.weak(format!("⚙ {}", entry.name));
-                                }
-                            },
-                        );
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_size, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if entry.kind == EntryKind::File {
-                                    ui.label(format_size(entry.size));
-                                } else {
-                                    ui.weak("—");
-                                }
-                            },
-                        );
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_date, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if entry.modified_ms == 0 {
-                                    ui.weak("—");
-                                } else {
-                                    ui.label(format_timestamp(entry.modified_ms));
-                                }
-                            },
-                        );
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_act, row_height),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if entry.kind == EntryKind::File
-                                    && row_button(ui, "↗ Open")
-                                        .on_hover_text(
-                                            "Copy to a temporary folder and open with the default app",
-                                        )
-                                        .clicked()
-                                {
-                                    action = Some(FileAction::Open(path.clone()));
-                                }
-                                if entry.kind != EntryKind::Other
-                                    && row_button(ui, "⬇ Save")
-                                        .on_hover_text("Download to Downloads/ADB Phone Manager")
-                                        .clicked()
-                                {
-                                    action = Some(FileAction::Download {
-                                        path: path.clone(),
-                                        is_dir: entry.kind == EntryKind::Directory,
-                                    });
-                                }
-                                if row_button(ui, "📋 Path")
-                                    .on_hover_text("Copy device path")
-                                    .clicked()
-                                {
-                                    action = Some(FileAction::CopyPath(path.clone()));
-                                }
-                            },
-                        );
+                    row.col(|ui| match entry.kind {
+                        EntryKind::Directory => {
+                            let response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("📁 {}", entry.name)).strong(),
+                                    )
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if response.clicked() {
+                                action = Some(FileAction::Browse(path.clone()));
+                            }
+                        }
+                        EntryKind::File => {
+                            let response = ui
+                                .add(
+                                    egui::Label::new(format!("📄 {}", entry.name))
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text("Double-click to open");
+                            if response.double_clicked() {
+                                action = Some(FileAction::Open(path.clone()));
+                            }
+                        }
+                        EntryKind::Other => {
+                            ui.add(
+                                egui::Label::new(RichText::new(format!("⚙ {}", entry.name)).weak())
+                                    .truncate(),
+                            );
+                        }
                     });
-                }
+                    row.col(|ui| {
+                        if entry.kind == EntryKind::File {
+                            ui.label(format_size(entry.size));
+                        } else {
+                            ui.weak("—");
+                        }
+                    });
+                    row.col(|ui| {
+                        if entry.modified_ms == 0 {
+                            ui.weak("—");
+                        } else {
+                            ui.label(format_timestamp(entry.modified_ms));
+                        }
+                    });
+                    row.col(|ui| {
+                        if entry.kind == EntryKind::File
+                            && row_button(ui, "↗ Open")
+                                .on_hover_text(
+                                    "Copy to a temporary folder and open with the default app",
+                                )
+                                .clicked()
+                        {
+                            action = Some(FileAction::Open(path.clone()));
+                        }
+                        if entry.kind != EntryKind::Other
+                            && row_button(ui, "⬇ Save")
+                                .on_hover_text("Download to Downloads/ADB Phone Manager")
+                                .clicked()
+                        {
+                            action = Some(FileAction::Download {
+                                path: path.clone(),
+                                is_dir: entry.kind == EntryKind::Directory,
+                            });
+                        }
+                        if row_button(ui, "📋 Path")
+                            .on_hover_text("Copy device path")
+                            .clicked()
+                        {
+                            action = Some(FileAction::CopyPath(path.clone()));
+                        }
+                    });
+                });
             });
 
         match action {
