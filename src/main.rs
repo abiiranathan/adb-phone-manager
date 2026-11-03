@@ -1,6 +1,19 @@
-//! ADB Phone Manager: a small egui front end for an Android phone reachable over adb.
+//! ADB Phone Manager: a front end for browsing and controlling an Android phone over adb.
 
 mod adb;
+mod capture;
+mod controls;
+mod device_info;
+mod export;
+mod extras;
+mod icons;
+mod jobs;
+mod logcat;
+mod package;
+mod raster;
+mod scrcpy;
+mod transfer;
+mod wireless;
 mod worker;
 
 use std::time::{Duration, Instant};
@@ -13,30 +26,20 @@ use crate::adb::{
     Contact, Device, EntryKind, RemoteEntry, Sms, SmsKind, StorageRoot, TextSegment,
     UninstallOutcome,
 };
+use crate::extras::{DeviceCtx, ExportData, Extras};
 use crate::worker::{Request, Response, Worker};
 
-/// Initial window size in logical pixels.
-const WINDOW_SIZE: [f32; 2] = [1050.0, 720.0];
-/// How often the call state is polled while a device is ready.
+const WINDOW_SIZE: [f32; 2] = [1120.0, 780.0];
 const CALL_POLL_INTERVAL: Duration = Duration::from_secs(3);
-/// Default number of SMS messages loaded.
 const DEFAULT_MESSAGE_LIMIT: usize = 200;
-/// Default number of call logs loaded.
 const DEFAULT_CALL_LIMIT: usize = 100;
-/// Allowed range for the limits control.
 const LIMIT_RANGE: std::ops::RangeInclusive<usize> = 10..=5000;
-/// adb state string for a connected, authorised device.
 const DEVICE_READY_STATE: &str = "device";
-/// Width of single-line input boxes.
 const INPUT_WIDTH: f32 = 220.0;
-/// Unit names used when formatting file sizes.
 const BYTE_UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-/// Factor between consecutive entries of [`BYTE_UNITS`].
 const UNIT_STEP: f64 = 1024.0;
-/// Height of one table row, tall enough for padded action buttons.
 const ROW_HEIGHT: f32 = 32.0;
 
-/// Top-level tabs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Calls,
@@ -44,15 +47,25 @@ enum Tab {
     Contacts,
     Apps,
     Files,
+    Mirror,
+    Control,
+    Info,
+    Logcat,
+    Tools,
 }
 
 impl Tab {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 10] = [
         Self::Calls,
         Self::Messages,
         Self::Contacts,
         Self::Apps,
         Self::Files,
+        Self::Mirror,
+        Self::Control,
+        Self::Info,
+        Self::Logcat,
+        Self::Tools,
     ];
 
     const fn title(self) -> &'static str {
@@ -62,42 +75,39 @@ impl Tab {
             Self::Contacts => "Contacts",
             Self::Apps => "Apps",
             Self::Files => "Files",
+            Self::Mirror => "Mirror",
+            Self::Control => "Control",
+            Self::Info => "Info",
+            Self::Logcat => "Logcat",
+            Self::Tools => "Tools",
         }
     }
 }
 
-/// Severity of the message shown in the status bar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StatusKind {
-    /// Informational message.
     Info,
-    /// Failure report, drawn in red.
     Error,
 }
 
-/// Row action chosen in the app list.
 enum AppAction {
     Launch(String),
     Stop(String),
-    /// Ask for confirmation before uninstalling the package.
     Uninstall(String),
+    Details(String),
 }
 
-/// Action chosen in the file browser during one frame.
 enum FileAction {
-    /// Show the directory at this device path.
     Browse(String),
-    /// Reload the current directory (or the storage list if none is shown yet).
     Reload,
-    /// Open the file at this device path with the desktop's default application.
     Open(String),
-    /// Save a file or directory to the downloads folder.
     Download { path: String, is_dir: bool },
-    /// Copy this device path to the clipboard.
     CopyPath(String),
+    NewFolder,
+    Upload,
+    Delete { path: String, is_dir: bool },
 }
 
-/// Derives a clean, readable name from an Android package identifier.
 fn app_display_name(pkg: &str) -> String {
     let parts: Vec<&str> = pkg.split('.').collect();
     if parts.is_empty() {
@@ -138,7 +148,6 @@ fn capitalize(s: &str) -> String {
     })
 }
 
-/// Formats duration in seconds into a human-readable string.
 fn format_duration(secs: u64) -> String {
     if secs == 0 {
         return "0s".to_owned();
@@ -155,12 +164,10 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// Formats a byte count using binary units, e.g. `1.5 KB`.
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes} B");
     }
-    // Precision loss is irrelevant: the value is only displayed with one decimal.
     #[allow(clippy::cast_precision_loss)]
     let mut value = bytes as f64 / UNIT_STEP;
     let mut unit = 1;
@@ -171,7 +178,6 @@ fn format_size(bytes: u64) -> String {
     format!("{value:.1} {}", BYTE_UNITS[unit])
 }
 
-/// Formats a millisecond Unix timestamp in the local time zone.
 fn format_timestamp(millis: i64) -> String {
     chrono::DateTime::from_timestamp_millis(millis).map_or_else(
         || "unknown time".to_owned(),
@@ -183,11 +189,6 @@ fn format_timestamp(millis: i64) -> String {
     )
 }
 
-/// Applies the application-wide typography, spacing and contrast tweaks.
-///
-/// egui's defaults target compact demos: small controls and secondary text that
-/// fades almost into the background. This app is mostly dense tables, so it uses
-/// slightly larger type, roomier widgets and higher-contrast text instead.
 fn configure_style(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         style.text_styles = [
@@ -233,9 +234,6 @@ fn configure_style(ctx: &egui::Context) {
         }
 
         if visuals.dark_mode {
-            // Weak text is painted half-way towards the panel background, so the
-            // default gray(140) body text fades to nearly invisible. A brighter
-            // base keeps timestamps and hints readable while staying secondary.
             let text = Color32::from_gray(235);
             visuals.widgets.noninteractive.fg_stroke.color = text;
             visuals.widgets.inactive.fg_stroke.color = text;
@@ -276,12 +274,10 @@ fn configure_style(ctx: &egui::Context) {
     });
 }
 
-/// Adds a row action button: full button padding, but capped to fit a table row.
 fn row_button(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>) -> egui::Response {
     ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, 22.0)))
 }
 
-/// Builds a `Name (number)` label with the name emphasised and the number muted.
 fn caller_label(ui: &egui::Ui, name: &str, number: &str) -> egui::text::LayoutJob {
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     let mut job = egui::text::LayoutJob::default();
@@ -306,7 +302,6 @@ fn caller_label(ui: &egui::Ui, name: &str, number: &str) -> egui::text::LayoutJo
     job
 }
 
-/// Collapses a message body into a short, single-line table preview.
 fn message_preview(body: &str) -> String {
     const MAX_CHARS: usize = 180;
 
@@ -332,7 +327,6 @@ fn message_preview(body: &str) -> String {
     }
 }
 
-/// Renders a message body, turning URLs into clickable links.
 fn ui_message_body(ui: &mut egui::Ui, body: &str) {
     for line in body.split('\n') {
         if line.is_empty() {
@@ -355,72 +349,45 @@ fn ui_message_body(ui: &mut egui::Ui, body: &str) {
     }
 }
 
-/// Application state. Lives on the UI thread only.
 struct PhoneApp {
-    /// Background job runner.
     worker: Worker,
-    /// App icon, also shown at the start of the toolbar.
+    extras: Extras,
     app_icon: Option<egui::TextureHandle>,
-    /// Devices from the last refresh.
     devices: Vec<Device>,
-    /// Serial of the active device.
     selected: Option<String>,
-    /// Visible tab.
     tab: Tab,
-    /// Loaded address book.
     contacts: Vec<Contact>,
-    /// Loaded SMS messages.
     messages: Vec<Sms>,
-    /// Message shown in the full-text dialog, if any.
     view_message: Option<Sms>,
-    /// Loaded call history.
     call_logs: Vec<CallRecord>,
-    /// Loaded package names.
     apps: Vec<String>,
-    /// Storage volumes of the active device (internal storage, SD card...).
     storage_roots: Vec<StorageRoot>,
-    /// Directory currently shown in the file browser.
     files_path: Option<String>,
-    /// Directory whose listing is in flight; any other listing that arrives is stale.
     files_requested: Option<String>,
-    /// Entries of `files_path`, directories first.
     entries: Vec<RemoteEntry>,
-    /// Latest polled telephony state.
     call_state: CallState,
-    /// Filter text per tab.
     contact_filter: String,
     message_filter: String,
     call_filter: String,
     app_filter: String,
     file_filter: String,
-    /// `host:port` typed into the toolbar.
     connect_input: String,
-    /// Number typed into the dialler.
     dial_input: String,
-    /// How many SMS messages to load.
     message_limit: usize,
-    /// How many call logs to load.
     call_limit: usize,
-    /// Hide system apps in the app list.
     third_party_only: bool,
-    /// Package waiting for the user to confirm its uninstall.
     pending_uninstall: Option<String>,
-    /// Show dot-files in the file browser.
     show_hidden: bool,
-    /// Status bar text and its severity.
     status: String,
     status_kind: StatusKind,
-    /// Foreground jobs in flight (drives the busy label).
     pending: usize,
-    /// Whether a call-state poll is in flight.
     poll_inflight: bool,
-    /// When the last poll was started.
     last_poll: Instant,
 }
 
 impl PhoneApp {
-    fn new(ctx: egui::Context) -> Self {
-        configure_style(&ctx);
+    fn new(ctx: &egui::Context) -> Self {
+        configure_style(ctx);
         let app_icon = app_icon().map(|icon| {
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [icon.width as usize, icon.height as usize],
@@ -428,9 +395,9 @@ impl PhoneApp {
             );
             ctx.load_texture("app_icon", image, egui::TextureOptions::LINEAR)
         });
-        // The worker's device watcher performs the first scan and reports it.
         Self {
-            worker: Worker::new(ctx),
+            worker: Worker::new(ctx.clone()),
+            extras: Extras::new(ctx),
             app_icon,
             devices: Vec::new(),
             selected: None,
@@ -465,13 +432,20 @@ impl PhoneApp {
         }
     }
 
-    /// Returns whether the selected device is connected and authorised.
     fn ready(&self) -> bool {
         self.selected.as_ref().is_some_and(|serial| {
             self.devices
                 .iter()
                 .any(|d| &d.serial == serial && d.state == DEVICE_READY_STATE)
         })
+    }
+
+    fn export_data(&self) -> ExportData {
+        ExportData {
+            contacts: self.contacts.clone(),
+            messages: self.messages.clone(),
+            calls: self.call_logs.clone(),
+        }
     }
 
     fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
@@ -483,7 +457,6 @@ impl PhoneApp {
         };
     }
 
-    /// Queues a foreground request, refusing device requests while no device is ready.
     fn submit(&mut self, request: Request) {
         if request.needs_device() && !self.ready() {
             self.set_status("No authorised device selected.", true);
@@ -493,7 +466,6 @@ impl PhoneApp {
         self.worker.submit(self.selected.clone(), request);
     }
 
-    /// Switches the active device and drops data that belonged to the previous one.
     fn select(&mut self, serial: Option<String>) {
         if self.selected == serial {
             return;
@@ -563,7 +535,6 @@ impl PhoneApp {
         }
     }
 
-    /// Applies every finished background result.
     fn drain_responses(&mut self) {
         while let Some(response) = self.worker.try_recv() {
             if !response.is_background() {
@@ -607,8 +578,6 @@ impl PhoneApp {
                     self.set_status(format!("Found {} storage volume(s).", roots.len()), false);
                     let first = roots.first().map(|root| root.path.clone());
                     self.storage_roots = roots;
-                    // Open the first volume automatically, but never override a navigation
-                    // the user already started.
                     if self.files_path.is_none() && self.files_requested.is_none() {
                         if let Some(path) = first {
                             self.browse(&path);
@@ -616,8 +585,6 @@ impl PhoneApp {
                     }
                 }
                 Response::Dir { path, entries } => {
-                    // Listings can finish out of order when the user clicks quickly;
-                    // only the most recently requested directory is shown.
                     if self.files_requested.as_deref() == Some(path.as_str()) {
                         self.set_status(format!("{} item(s) in {path}.", entries.len()), false);
                         self.files_requested = None;
@@ -635,10 +602,7 @@ impl PhoneApp {
         }
     }
 
-    /// Starts a background call-state poll when the Calls tab is visible.
     fn poll_call_state(&mut self, ctx: &egui::Context) {
-        // The state is only displayed on the Calls tab, so polling from any other
-        // tab just wakes the UI and the phone for no visible benefit.
         if self.tab != Tab::Calls || !self.ready() || self.poll_inflight {
             return;
         }
@@ -672,7 +636,6 @@ impl PhoneApp {
         });
     }
 
-    /// Requests the listing of `path`; the file browser switches to it when it arrives.
     fn browse(&mut self, path: &str) {
         self.files_requested = Some(path.to_owned());
         self.submit(Request::ListDir {
@@ -680,7 +643,6 @@ impl PhoneApp {
         });
     }
 
-    /// Returns the storage volume containing `path`, preferring the deepest match.
     fn root_for(&self, path: &str) -> Option<&StorageRoot> {
         self.storage_roots
             .iter()
@@ -694,7 +656,6 @@ impl PhoneApp {
             .max_by_key(|root| root.path.len())
     }
 
-    /// Switches tab, loading its data on first visit.
     fn switch_tab(&mut self, tab: Tab) {
         self.tab = tab;
         if !self.ready() {
@@ -760,10 +721,7 @@ impl PhoneApp {
                     self.submit(Request::Connect(address));
                 }
             }
-            if self.pending > 0 {
-                // A spinner asks egui to repaint continuously. Long adb transfers
-                // (a big folder pull, for example) would then keep the UI drawing
-                // at full speed for minutes, so use a static busy label instead.
+            if self.pending > 0 || self.extras.busy() {
                 ui.weak("Working…");
             }
         });
@@ -1086,7 +1044,6 @@ impl PhoneApp {
         }
     }
 
-    /// Shows the full body of the selected message.
     fn ui_message_dialog(&mut self, ctx: &egui::Context) {
         let Some(sms) = self.view_message.clone() else {
             return;
@@ -1157,7 +1114,6 @@ impl PhoneApp {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn ui_contacts(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Reload").clicked() {
@@ -1265,6 +1221,7 @@ impl PhoneApp {
             {
                 self.load_apps();
             }
+            ui.checkbox(&mut self.extras.load_icons, "Icons");
             ui.add(
                 egui::TextEdit::singleline(&mut self.app_filter)
                     .hint_text("Filter apps")
@@ -1288,6 +1245,12 @@ impl PhoneApp {
 
         let mut action: Option<AppAction> = None;
         let mut copy_pkg: Option<String> = None;
+        let selected = self.selected.clone();
+        let ready = self.ready();
+        let dev = DeviceCtx {
+            serial: selected.as_deref(),
+            ready,
+        };
 
         TableBuilder::new(ui)
             .id_salt("apps_table")
@@ -1295,9 +1258,9 @@ impl PhoneApp {
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, false])
-            .column(Column::initial(200.0).at_least(160.0).clip(true))
+            .column(Column::initial(220.0).at_least(180.0).clip(true))
             .column(Column::remainder().at_least(220.0).clip(true))
-            .column(Column::initial(390.0).at_least(360.0))
+            .column(Column::initial(430.0).at_least(400.0))
             .header(26.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("App Name");
@@ -1313,6 +1276,9 @@ impl PhoneApp {
                 body.rows(ROW_HEIGHT, visible.len(), |mut row| {
                     let (package, name) = &visible[row.index()];
                     row.col(|ui| {
+                        if let Some(tex) = self.extras.icon_for(package, &dev) {
+                            ui.image((tex.id(), egui::vec2(20.0, 20.0)));
+                        }
                         ui.add(
                             egui::Label::new(RichText::new(name).strong())
                                 .selectable(true)
@@ -1339,6 +1305,12 @@ impl PhoneApp {
                         {
                             action = Some(AppAction::Stop((*package).clone()));
                         }
+                        if row_button(ui, "ℹ Details")
+                            .on_hover_text("View app details and permissions")
+                            .clicked()
+                        {
+                            action = Some(AppAction::Details((*package).clone()));
+                        }
                         if row_button(
                             ui,
                             RichText::new("🗑 Uninstall").color(ui.visuals().error_fg_color),
@@ -1363,6 +1335,15 @@ impl PhoneApp {
         match action {
             Some(AppAction::Launch(package)) => self.submit(Request::Launch(package)),
             Some(AppAction::Stop(package)) => self.submit(Request::ForceStop(package)),
+            Some(AppAction::Details(package)) => {
+                let selected = self.selected.clone();
+                let ready = self.ready();
+                let dev = DeviceCtx {
+                    serial: selected.as_deref(),
+                    ready,
+                };
+                self.extras.open_app_details(package, &dev);
+            }
             Some(AppAction::Uninstall(package)) => self.pending_uninstall = Some(package),
             None => {}
         }
@@ -1372,7 +1353,6 @@ impl PhoneApp {
         }
     }
 
-    /// Asks for confirmation before queueing the pending uninstall.
     fn ui_uninstall_dialog(&mut self, ctx: &egui::Context) {
         let Some(package) = self.pending_uninstall.clone() else {
             return;
@@ -1423,12 +1403,10 @@ impl PhoneApp {
         }
     }
 
-    /// File browser: storage picker, breadcrumb, and a table of the current directory.
     #[allow(clippy::too_many_lines)]
     fn ui_files(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<FileAction> = None;
 
-        // Snapshot what the closures below need, so they do not borrow `self` as a whole.
         let current_dir = self.files_path.clone();
         let root = current_dir
             .as_deref()
@@ -1467,6 +1445,12 @@ impl PhoneApp {
             }
             if ui.button("Reload").clicked() {
                 action = Some(FileAction::Reload);
+            }
+            if ui.button("📁+ New Folder").clicked() {
+                action = Some(FileAction::NewFolder);
+            }
+            if ui.button("⬆ Upload…").clicked() {
+                action = Some(FileAction::Upload);
             }
             ui.checkbox(&mut self.show_hidden, "Show hidden");
             ui.add(
@@ -1526,7 +1510,7 @@ impl PhoneApp {
             .column(Column::remainder().at_least(200.0).clip(true))
             .column(Column::initial(100.0).at_least(85.0))
             .column(Column::initial(160.0).at_least(140.0))
-            .column(Column::initial(280.0).at_least(260.0))
+            .column(Column::initial(340.0).at_least(320.0))
             .header(26.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("Name");
@@ -1619,6 +1603,15 @@ impl PhoneApp {
                         {
                             action = Some(FileAction::CopyPath(path.clone()));
                         }
+                        if row_button(ui, RichText::new("🗑").color(ui.visuals().error_fg_color))
+                            .on_hover_text("Delete from phone")
+                            .clicked()
+                        {
+                            action = Some(FileAction::Delete {
+                                path: path.clone(),
+                                is_dir: entry.kind == EntryKind::Directory,
+                            });
+                        }
                     });
                 });
             });
@@ -1629,6 +1622,25 @@ impl PhoneApp {
                 Some(path) => self.browse(&path),
                 None => self.submit(Request::LoadStorage),
             },
+            Some(FileAction::NewFolder) => {
+                if let Some(dir) = &self.files_path {
+                    self.extras.prompt_new_folder(dir.clone());
+                }
+            }
+            Some(FileAction::Upload) => {
+                if let Some(dir) = &self.files_path {
+                    let selected = self.selected.clone();
+                    let ready = self.ready();
+                    let dev = DeviceCtx {
+                        serial: selected.as_deref(),
+                        ready,
+                    };
+                    self.extras.upload_dialog(&dev, dir);
+                }
+            }
+            Some(FileAction::Delete { path, is_dir }) => {
+                self.extras.prompt_delete(path, is_dir);
+            }
             Some(FileAction::Open(path)) => {
                 self.set_status(format!("Opening {path}..."), false);
                 self.submit(Request::OpenRemote { path });
@@ -1647,7 +1659,6 @@ impl PhoneApp {
 }
 
 impl Drop for PhoneApp {
-    /// Removes the temporary copies made by "Open" so device files do not linger on disk.
     fn drop(&mut self) {
         adb::cleanup_open_cache();
     }
@@ -1658,6 +1669,23 @@ impl eframe::App for PhoneApp {
         self.drain_responses();
         self.poll_call_state(ctx);
 
+        let selected = self.selected.clone();
+        let ready = self.ready();
+        let dev = DeviceCtx {
+            serial: selected.as_deref(),
+            ready,
+        };
+        self.extras.update(ctx, &dev);
+
+        if let Some((msg, is_err)) = self.extras.take_status() {
+            self.set_status(msg, is_err);
+        }
+        if self.extras.take_files_dirty() {
+            if let Some(path) = self.files_path.clone() {
+                self.browse(&path);
+            }
+        }
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.ui_toolbar(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             let text = RichText::new(&self.status);
@@ -1666,6 +1694,7 @@ impl eframe::App for PhoneApp {
                 StatusKind::Info => text,
             });
         });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for tab in Tab::ALL {
@@ -1675,24 +1704,75 @@ impl eframe::App for PhoneApp {
                 }
             });
             ui.separator();
+
+            let export_data = self.export_data();
+
             match self.tab {
                 Tab::Calls => self.ui_calls(ui),
                 Tab::Messages => self.ui_messages(ui),
                 Tab::Contacts => self.ui_contacts(ui),
                 Tab::Apps => self.ui_apps(ui),
                 Tab::Files => self.ui_files(ui),
+                Tab::Mirror => {
+                    let selected = self.selected.clone();
+                    let ready = self.ready();
+                    let dev_ctx = DeviceCtx {
+                        serial: selected.as_deref(),
+                        ready,
+                    };
+                    self.extras.ui_mirror(ui, &dev_ctx);
+                }
+                Tab::Control => {
+                    let selected = self.selected.clone();
+                    let ready = self.ready();
+                    let dev_ctx = DeviceCtx {
+                        serial: selected.as_deref(),
+                        ready,
+                    };
+                    self.extras.ui_control(ui, &dev_ctx);
+                }
+                Tab::Info => {
+                    let selected = self.selected.clone();
+                    let ready = self.ready();
+                    let dev_ctx = DeviceCtx {
+                        serial: selected.as_deref(),
+                        ready,
+                    };
+                    self.extras.ui_info(ui, &dev_ctx);
+                }
+                Tab::Logcat => {
+                    let selected = self.selected.clone();
+                    let ready = self.ready();
+                    let dev_ctx = DeviceCtx {
+                        serial: selected.as_deref(),
+                        ready,
+                    };
+                    self.extras.ui_logcat(ui, &dev_ctx);
+                }
+                Tab::Tools => {
+                    let selected = self.selected.clone();
+                    let ready = self.ready();
+                    let dev_ctx = DeviceCtx {
+                        serial: selected.as_deref(),
+                        ready,
+                    };
+                    self.extras.ui_tools(ui, &dev_ctx, &export_data);
+                }
             }
         });
+
         self.ui_uninstall_dialog(ctx);
         self.ui_message_dialog(ctx);
+        let selected = self.selected.clone();
+        let ready = self.ready();
+        let dev_ctx = DeviceCtx {
+            serial: selected.as_deref(),
+            ready,
+        };
+        self.extras.ui_windows(ctx, &dev_ctx);
     }
 }
 
-/// The window icon used on platforms that accept one directly (X11, Windows, macOS).
-///
-/// Wayland intentionally does not let clients set arbitrary window icons; compositors
-/// resolve the icon from the desktop entry whose id matches our app id. The same PNG is
-/// installed by `packaging/install-linux.sh` for that lookup.
 fn app_icon() -> Option<egui::IconData> {
     eframe::icon_data::from_png_bytes(include_bytes!(
         "../assets/icons/hicolor/256x256/apps/adb-phone-manager.png"
@@ -1716,7 +1796,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ADB Phone Manager",
         options,
-        Box::new(|cc| Ok(Box::new(PhoneApp::new(cc.egui_ctx.clone())))),
+        Box::new(|cc| Ok(Box::new(PhoneApp::new(&cc.egui_ctx)))),
     )
 }
 
