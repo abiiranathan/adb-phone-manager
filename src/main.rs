@@ -306,6 +306,55 @@ fn caller_label(ui: &egui::Ui, name: &str, number: &str) -> egui::text::LayoutJo
     job
 }
 
+/// Collapses a message body into a short, single-line table preview.
+fn message_preview(body: &str) -> String {
+    const MAX_CHARS: usize = 180;
+
+    let mut preview = String::new();
+    for (count, ch) in body.chars().enumerate() {
+        if count >= MAX_CHARS {
+            preview.push('…');
+            break;
+        }
+        if ch.is_whitespace() {
+            if !preview.is_empty() && !preview.ends_with(' ') {
+                preview.push(' ');
+            }
+        } else {
+            preview.push(ch);
+        }
+    }
+    let preview = preview.trim();
+    if preview.is_empty() {
+        "—".to_owned()
+    } else {
+        preview.to_owned()
+    }
+}
+
+/// Renders a message body, turning URLs into clickable links.
+fn ui_message_body(ui: &mut egui::Ui, body: &str) {
+    for line in body.split('\n') {
+        if line.is_empty() {
+            ui.add_space(4.0);
+            continue;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for segment in parse_text_segments(line) {
+                match segment {
+                    TextSegment::Text(text) => {
+                        ui.add(egui::Label::new(text).selectable(true));
+                    }
+                    TextSegment::Url(url) => {
+                        ui.hyperlink(url);
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Application state. Lives on the UI thread only.
 struct PhoneApp {
     /// Background job runner.
@@ -320,6 +369,8 @@ struct PhoneApp {
     contacts: Vec<Contact>,
     /// Loaded SMS messages.
     messages: Vec<Sms>,
+    /// Message shown in the full-text dialog, if any.
+    view_message: Option<Sms>,
     /// Loaded call history.
     call_logs: Vec<CallRecord>,
     /// Loaded package names.
@@ -357,7 +408,7 @@ struct PhoneApp {
     /// Status bar text and its severity.
     status: String,
     status_kind: StatusKind,
-    /// Foreground jobs in flight (drives the spinner).
+    /// Foreground jobs in flight (drives the busy label).
     pending: usize,
     /// Whether a call-state poll is in flight.
     poll_inflight: bool,
@@ -376,6 +427,7 @@ impl PhoneApp {
             tab: Tab::Calls,
             contacts: Vec::new(),
             messages: Vec::new(),
+            view_message: None,
             call_logs: Vec::new(),
             apps: Vec::new(),
             storage_roots: Vec::new(),
@@ -439,6 +491,7 @@ impl PhoneApp {
         self.selected = serial;
         self.contacts.clear();
         self.messages.clear();
+        self.view_message = None;
         self.call_logs.clear();
         self.apps.clear();
         self.storage_roots.clear();
@@ -484,11 +537,19 @@ impl PhoneApp {
             }
         }
         self.devices = devices;
-        if self.ready() && self.tab == Tab::Calls && self.call_logs.is_empty() {
-            self.load_call_logs();
-        }
-        if self.ready() && self.tab == Tab::Files && self.storage_roots.is_empty() {
-            self.submit(Request::LoadStorage);
+        if self.ready() {
+            match self.tab {
+                Tab::Calls if self.call_logs.is_empty() => self.load_call_logs(),
+                Tab::Messages if self.messages.is_empty() => self.load_messages(),
+                Tab::Contacts if self.contacts.is_empty() => {
+                    self.submit(Request::LoadContacts);
+                }
+                Tab::Apps if self.apps.is_empty() => self.load_apps(),
+                Tab::Files if self.storage_roots.is_empty() => {
+                    self.submit(Request::LoadStorage);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -564,18 +625,23 @@ impl PhoneApp {
         }
     }
 
-    /// Starts a background call-state poll when one is due.
+    /// Starts a background call-state poll when the Calls tab is visible.
     fn poll_call_state(&mut self, ctx: &egui::Context) {
-        if !self.ready() {
+        // The state is only displayed on the Calls tab, so polling from any other
+        // tab just wakes the UI and the phone for no visible benefit.
+        if self.tab != Tab::Calls || !self.ready() || self.poll_inflight {
             return;
         }
-        if !self.poll_inflight && self.last_poll.elapsed() >= CALL_POLL_INTERVAL {
+
+        let elapsed = self.last_poll.elapsed();
+        if elapsed >= CALL_POLL_INTERVAL {
             self.poll_inflight = true;
             self.last_poll = Instant::now();
             self.worker
                 .submit(self.selected.clone(), Request::PollCallState);
+        } else {
+            ctx.request_repaint_after(CALL_POLL_INTERVAL.saturating_sub(elapsed));
         }
-        ctx.request_repaint_after(CALL_POLL_INTERVAL);
     }
 
     fn load_messages(&mut self) {
@@ -677,7 +743,10 @@ impl PhoneApp {
                 }
             }
             if self.pending > 0 {
-                ui.spinner();
+                // A spinner asks egui to repaint continuously. Long adb transfers
+                // (a big folder pull, for example) would then keep the UI drawing
+                // at full speed for minutes, so use a static busy label instead.
+                ui.weak("Working…");
             }
         });
     }
@@ -882,94 +951,191 @@ impl PhoneApp {
         ui.separator();
 
         let needle = self.message_filter.to_lowercase();
+        let visible: Vec<&Sms> = self
+            .messages
+            .iter()
+            .filter(|m| {
+                needle.is_empty()
+                    || m.address.to_lowercase().contains(&needle)
+                    || m.body.to_lowercase().contains(&needle)
+            })
+            .collect();
+
         let mut dial_number: Option<String> = None;
-        let mut copy_msg: Option<String> = None;
+        let mut copy_number: Option<String> = None;
+        let mut view_sms: Option<Sms> = None;
 
-        egui::ScrollArea::vertical()
+        TableBuilder::new(ui)
+            .id_salt("messages_table")
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for sms in self.messages.iter().filter(|m| {
-                    needle.is_empty()
-                        || m.address.to_lowercase().contains(&needle)
-                        || m.body.to_lowercase().contains(&needle)
-                }) {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            let (kind_color, kind_text) = match sms.kind {
-                                SmsKind::Received => (Color32::LIGHT_GREEN, "IN"),
-                                SmsKind::Sent => (Color32::from_rgb(100, 180, 255), "OUT"),
-                                SmsKind::Other => (Color32::GRAY, "---"),
-                            };
-                            ui.label(
-                                RichText::new(kind_text)
-                                    .color(kind_color)
-                                    .monospace()
-                                    .strong(),
-                            );
-                            ui.add(
-                                egui::Label::new(RichText::new(&sms.address).strong())
-                                    .selectable(true),
-                            );
-                            ui.weak(format_timestamp(sms.date_ms));
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if row_button(ui, "📋 Copy Text")
-                                        .on_hover_text("Copy message body")
-                                        .clicked()
-                                    {
-                                        copy_msg = Some(sms.body.clone());
-                                    }
-                                    if row_button(ui, "📋 Copy Number")
-                                        .on_hover_text("Copy phone number")
-                                        .clicked()
-                                    {
-                                        copy_msg = Some(sms.address.clone());
-                                    }
-                                    if row_button(ui, "📞 Call")
-                                        .on_hover_text("Call number")
-                                        .clicked()
-                                    {
-                                        dial_number = Some(sms.address.clone());
-                                    }
-                                },
-                            );
-                        });
-
-                        ui.add_space(3.0);
-
-                        for line in sms.body.split('\n') {
-                            if line.is_empty() {
-                                ui.add_space(4.0);
-                                continue;
-                            }
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                for segment in parse_text_segments(line) {
-                                    match segment {
-                                        TextSegment::Text(t) => {
-                                            ui.add(egui::Label::new(t).selectable(true));
-                                        }
-                                        TextSegment::Url(url) => {
-                                            ui.hyperlink(url);
-                                        }
-                                    }
-                                }
-                            });
+            .column(Column::initial(55.0).at_least(50.0))
+            .column(Column::initial(140.0).at_least(110.0))
+            .column(Column::initial(140.0).at_least(120.0))
+            .column(Column::remainder().at_least(160.0).clip(true))
+            .column(Column::initial(250.0).at_least(230.0))
+            .header(26.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Dir");
+                });
+                header.col(|ui| {
+                    ui.strong("Number");
+                });
+                header.col(|ui| {
+                    ui.strong("Date");
+                });
+                header.col(|ui| {
+                    ui.strong("Message");
+                });
+                header.col(|ui| {
+                    ui.strong("Actions");
+                });
+            })
+            .body(|body| {
+                body.rows(ROW_HEIGHT, visible.len(), |mut row| {
+                    let sms = visible[row.index()];
+                    row.col(|ui| {
+                        let (kind_color, kind_text) = match sms.kind {
+                            SmsKind::Received => (Color32::LIGHT_GREEN, "IN"),
+                            SmsKind::Sent => (Color32::from_rgb(100, 180, 255), "OUT"),
+                            SmsKind::Other => (Color32::GRAY, "---"),
+                        };
+                        ui.label(
+                            RichText::new(kind_text)
+                                .color(kind_color)
+                                .monospace()
+                                .strong(),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&sms.address).monospace())
+                                .selectable(true)
+                                .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.label(format_timestamp(sms.date_ms));
+                    });
+                    row.col(|ui| {
+                        if ui
+                            .add(
+                                egui::Label::new(message_preview(&sms.body))
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Open the full message")
+                            .clicked()
+                        {
+                            view_sms = Some(sms.clone());
                         }
                     });
-                    ui.add_space(4.0);
-                }
+                    row.col(|ui| {
+                        if row_button(ui, "📞 Call")
+                            .on_hover_text("Call this number")
+                            .clicked()
+                        {
+                            dial_number = Some(sms.address.clone());
+                        }
+                        if row_button(ui, "📋 Copy")
+                            .on_hover_text("Copy this number")
+                            .clicked()
+                        {
+                            copy_number = Some(sms.address.clone());
+                        }
+                        if row_button(ui, "🔍 View")
+                            .on_hover_text("Open the full message")
+                            .clicked()
+                        {
+                            view_sms = Some(sms.clone());
+                        }
+                    });
+                });
             });
 
         if let Some(number) = dial_number {
             self.dial_input.clone_from(&number);
             self.submit(Request::Dial(number));
         }
-        if let Some(text) = copy_msg {
-            ui.ctx().copy_text(text.clone());
-            self.set_status(format!("Copied to clipboard: {text}"), false);
+        if let Some(number) = copy_number {
+            ui.ctx().copy_text(number.clone());
+            self.set_status(format!("Copied {number} to clipboard."), false);
+        }
+        if let Some(sms) = view_sms {
+            self.view_message = Some(sms);
+        }
+    }
+
+    /// Shows the full body of the selected message.
+    fn ui_message_dialog(&mut self, ctx: &egui::Context) {
+        let Some(sms) = self.view_message.clone() else {
+            return;
+        };
+
+        let mut close = false;
+        let mut copy_text = false;
+        let mut copy_number = false;
+        let mut dial_number: Option<String> = None;
+
+        egui::Modal::new(egui::Id::new("message-dialog")).show(ctx, |ui| {
+            ui.set_max_width(620.0);
+            ui.heading("Message");
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let (kind_color, kind_text) = match sms.kind {
+                    SmsKind::Received => (Color32::LIGHT_GREEN, "Received"),
+                    SmsKind::Sent => (Color32::from_rgb(100, 180, 255), "Sent"),
+                    SmsKind::Other => (Color32::GRAY, "Other"),
+                };
+                ui.colored_label(kind_color, kind_text);
+                ui.add(
+                    egui::Label::new(RichText::new(&sms.address).monospace().strong())
+                        .selectable(true),
+                );
+                ui.weak(format_timestamp(sms.date_ms));
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui_message_body(ui, &sms.body);
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("📞 Call").clicked() {
+                    dial_number = Some(sms.address.clone());
+                }
+                if ui.button("📋 Copy number").clicked() {
+                    copy_number = true;
+                }
+                if ui.button("📋 Copy text").clicked() {
+                    copy_text = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        });
+
+        if close {
+            self.view_message = None;
+        }
+        if copy_text {
+            ctx.copy_text(sms.body.clone());
+            self.set_status("Copied message text to clipboard.", false);
+        }
+        if copy_number {
+            ctx.copy_text(sms.address.clone());
+            self.set_status(format!("Copied {} to clipboard.", sms.address), false);
+        }
+        if let Some(number) = dial_number {
+            self.dial_input.clone_from(&number);
+            self.submit(Request::Dial(number));
         }
     }
 
@@ -1500,12 +1666,14 @@ impl eframe::App for PhoneApp {
             }
         });
         self.ui_uninstall_dialog(ctx);
+        self.ui_message_dialog(ctx);
     }
 }
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("adb-phone-manager")
             .with_inner_size(WINDOW_SIZE)
             .with_title("ADB Phone Manager"),
         ..Default::default()
