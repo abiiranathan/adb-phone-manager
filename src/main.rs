@@ -359,6 +359,8 @@ fn ui_message_body(ui: &mut egui::Ui, body: &str) {
 struct PhoneApp {
     /// Background job runner.
     worker: Worker,
+    /// App icon, also shown at the start of the toolbar.
+    app_icon: Option<egui::TextureHandle>,
     /// Devices from the last refresh.
     devices: Vec<Device>,
     /// Serial of the active device.
@@ -419,9 +421,17 @@ struct PhoneApp {
 impl PhoneApp {
     fn new(ctx: egui::Context) -> Self {
         configure_style(&ctx);
+        let app_icon = app_icon().map(|icon| {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            );
+            ctx.load_texture("app_icon", image, egui::TextureOptions::LINEAR)
+        });
         // The worker's device watcher performs the first scan and reports it.
         Self {
             worker: Worker::new(ctx),
+            app_icon,
             devices: Vec::new(),
             selected: None,
             tab: Tab::Calls,
@@ -709,6 +719,14 @@ impl PhoneApp {
 
     fn ui_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            if let Some(icon) = &self.app_icon {
+                ui.add(
+                    egui::Image::new(icon)
+                        .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                        .corner_radius(6.0),
+                );
+                ui.separator();
+            }
             ui.label("Device:");
             let mut chosen: Option<String> = None;
             egui::ComboBox::from_id_salt("device_picker")
@@ -1670,12 +1688,29 @@ impl eframe::App for PhoneApp {
     }
 }
 
+/// The window icon used on platforms that accept one directly (X11, Windows, macOS).
+///
+/// Wayland intentionally does not let clients set arbitrary window icons; compositors
+/// resolve the icon from the desktop entry whose id matches our app id. The same PNG is
+/// installed by `packaging/install-linux.sh` for that lookup.
+fn app_icon() -> Option<egui::IconData> {
+    eframe::icon_data::from_png_bytes(include_bytes!(
+        "../assets/icons/hicolor/256x256/apps/adb-phone-manager.png"
+    ))
+    .ok()
+}
+
 fn main() -> eframe::Result {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id("adb-phone-manager")
+        .with_inner_size(WINDOW_SIZE)
+        .with_title("ADB Phone Manager");
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_app_id("adb-phone-manager")
-            .with_inner_size(WINDOW_SIZE)
-            .with_title("ADB Phone Manager"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

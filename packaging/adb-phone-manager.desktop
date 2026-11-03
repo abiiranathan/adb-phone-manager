@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=ADB Phone Manager
+GenericName=Android Phone Manager
+Comment=Browse and manage an Android phone over adb
+Exec=adb-phone-manager
+TryExec=adb-phone-manager
+Icon=adb-phone-manager
+Terminal=false
+Categories=Utility;
+Keywords=android;adb;phone;sms;contacts;files;
+StartupNotify=true
+StartupWMClass=adb-phone-manager
