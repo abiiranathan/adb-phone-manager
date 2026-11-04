@@ -12,6 +12,9 @@ egui_extras = { version = "0.31", default-features = false }
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 strip = true

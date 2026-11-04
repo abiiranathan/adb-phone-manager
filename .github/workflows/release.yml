@@ -1,0 +1,281 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux AppImage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            file \
+            libgtk-3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-icccm4-dev \
+            libxcb-keysyms1-dev \
+            libxcb-randr0-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+
+      - name: Read version
+        run: |
+          version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          test -n "$version"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Build AppImage
+        run: |
+          set -euo pipefail
+          appdir="$PWD/dist/AppDir"
+          rm -rf "$appdir"
+          mkdir -p \
+            "$appdir/usr/bin" \
+            "$appdir/usr/share/applications" \
+            "$appdir/usr/share/icons/hicolor/scalable/apps"
+
+          install -Dm755 target/release/adb-phone-manager "$appdir/usr/bin/adb-phone-manager"
+          install -Dm755 packaging/appimage/AppRun "$appdir/AppRun"
+          install -Dm644 packaging/adb-phone-manager.desktop "$appdir/adb-phone-manager.desktop"
+          install -Dm644 packaging/adb-phone-manager.desktop \
+            "$appdir/usr/share/applications/adb-phone-manager.desktop"
+          install -Dm644 assets/adb-phone-manager.svg \
+            "$appdir/usr/share/icons/hicolor/scalable/apps/adb-phone-manager.svg"
+          install -Dm644 assets/icons/hicolor/256x256/apps/adb-phone-manager.png \
+            "$appdir/adb-phone-manager.png"
+
+          for size in 16 24 32 48 64 128 256 512; do
+            install -Dm644 \
+              "assets/icons/hicolor/${size}x${size}/apps/adb-phone-manager.png" \
+              "$appdir/usr/share/icons/hicolor/${size}x${size}/apps/adb-phone-manager.png"
+          done
+
+          curl -fsSL -o "$PWD/dist/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "$PWD/dist/appimagetool"
+
+          ARCH=x86_64 "$PWD/dist/appimagetool" --appimage-extract-and-run "$appdir" \
+            "dist/ADB-Phone-Manager-${VERSION}-x86_64.AppImage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/*.AppImage
+          retention-days: 7
+
+  windows:
+    name: Windows MSI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          test -n "$version"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+          msi_version=$(printf '%s' "$version" | sed -E 's/[^0-9.].*$//')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "MSI_VERSION=$msi_version" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Locate WiX Toolset
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "$env:WIX\bin\candle.exe",
+            "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin\candle.exe",
+            "${env:ProgramFiles(x86)}\WiX Toolset v3.11\bin\candle.exe",
+            "$env:ProgramFiles\WiX Toolset v3.14\bin\candle.exe"
+          )
+          $candle = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $candle) {
+            $command = Get-Command candle.exe -ErrorAction SilentlyContinue
+            if ($command) { $candle = $command.Source }
+          }
+          if (-not $candle) {
+            choco install wixtoolset --version=3.14.1 -y --no-progress
+            $candle = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin\candle.exe"
+          }
+          if (-not (Test-Path $candle)) {
+            throw "WiX Toolset candle.exe was not found"
+          }
+          $wixBin = Split-Path $candle -Parent
+          "WIX_BIN=$wixBin" >> $env:GITHUB_ENV
+          Write-Host "Using WiX from $wixBin"
+
+      - name: Build MSI
+        shell: bash
+        run: |
+          set -euo pipefail
+          WIX_BIN=$(cygpath -u "$WIX_BIN")
+          mkdir -p dist
+          "$WIX_BIN/candle.exe" -nologo -arch x64 -ext WixUIExtension \
+            -dProductVersion="$MSI_VERSION" \
+            -dSourceDir="$(cygpath -w "$PWD/target/release")" \
+            -dIconPath="$(cygpath -w "$PWD/assets/adb-phone-manager.ico")" \
+            -dLicensePath="$(cygpath -w "$PWD/packaging/windows/license.rtf")" \
+            -out "dist/main.wixobj" \
+            packaging/windows/main.wxs
+          "$WIX_BIN/light.exe" -nologo -ext WixUIExtension -cultures:en-us \
+            -out "dist/ADB-Phone-Manager-${VERSION}-x86_64.msi" \
+            dist/main.wixobj
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: dist/*.msi
+          retention-days: 7
+
+  macos:
+    name: macOS DMG
+    runs-on: macos-14
+    # The macOS package is a best-effort extra: do not block the Linux and
+    # Windows release if Apple tooling changes or the universal build fails.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version
+        run: |
+          version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          test -n "$version"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build universal binary
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/adb-phone-manager \
+            target/x86_64-apple-darwin/release/adb-phone-manager \
+            -output dist/adb-phone-manager
+
+      - name: Build application bundle
+        run: |
+          set -euo pipefail
+          app="$PWD/dist/ADB Phone Manager.app"
+          iconset="$PWD/dist/AppIcon.iconset"
+          resources="$app/Contents/Resources"
+
+          rm -rf "$app" "$iconset"
+          mkdir -p "$app/Contents/MacOS" "$resources" "$iconset"
+
+          install -m 755 dist/adb-phone-manager "$app/Contents/MacOS/adb-phone-manager"
+          sed "s/__VERSION__/${VERSION}/g" packaging/macos/Info.plist \
+            > "$app/Contents/Info.plist"
+
+          icon_source="assets/icons/hicolor"
+          cp "$icon_source/16x16/apps/adb-phone-manager.png" "$iconset/icon_16x16.png"
+          cp "$icon_source/32x32/apps/adb-phone-manager.png" "$iconset/icon_16x16@2x.png"
+          cp "$icon_source/32x32/apps/adb-phone-manager.png" "$iconset/icon_32x32.png"
+          cp "$icon_source/64x64/apps/adb-phone-manager.png" "$iconset/icon_32x32@2x.png"
+          cp "$icon_source/128x128/apps/adb-phone-manager.png" "$iconset/icon_128x128.png"
+          cp "$icon_source/256x256/apps/adb-phone-manager.png" "$iconset/icon_128x128@2x.png"
+          cp "$icon_source/256x256/apps/adb-phone-manager.png" "$iconset/icon_256x256.png"
+          cp "$icon_source/512x512/apps/adb-phone-manager.png" "$iconset/icon_256x256@2x.png"
+          cp "$icon_source/512x512/apps/adb-phone-manager.png" "$iconset/icon_512x512.png"
+          sips -z 1024 1024 "$icon_source/512x512/apps/adb-phone-manager.png" \
+            --out "$iconset/icon_512x512@2x.png" >/dev/null
+
+          iconutil -c icns "$iconset" -o "$resources/AppIcon.icns"
+
+          xattr -cr "$app"
+          codesign --force --deep --sign - "$app"
+
+      - name: Build DMG
+        run: |
+          set -euo pipefail
+          staging="$PWD/dist/dmg"
+          rm -rf "$staging"
+          mkdir -p "$staging"
+          cp -R "dist/ADB Phone Manager.app" "$staging/"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create \
+            -volname "ADB Phone Manager" \
+            -srcfolder "$staging" \
+            -ov -format UDZO \
+            "dist/ADB-Phone-Manager-${VERSION}-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/*.dmg
+          retention-days: 7
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - linux
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

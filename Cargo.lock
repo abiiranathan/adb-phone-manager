@@ -118,6 +118,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "image",
+ "libc",
  "rfd",
 ]
 

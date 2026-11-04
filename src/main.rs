@@ -1,5 +1,7 @@
 //! ADB Phone Manager: a front end for browsing and controlling an Android phone over adb.
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod adb;
 mod capture;
 mod controls;
@@ -16,6 +18,7 @@ mod transfer;
 mod wireless;
 mod worker;
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
@@ -358,6 +361,8 @@ struct PhoneApp {
     tab: Tab,
     contacts: Vec<Contact>,
     messages: Vec<Sms>,
+    message_selection: HashSet<i64>,
+    pending_message_delete: Option<Vec<i64>>,
     view_message: Option<Sms>,
     call_logs: Vec<CallRecord>,
     apps: Vec<String>,
@@ -404,6 +409,8 @@ impl PhoneApp {
             tab: Tab::Calls,
             contacts: Vec::new(),
             messages: Vec::new(),
+            message_selection: HashSet::new(),
+            pending_message_delete: None,
             view_message: None,
             call_logs: Vec::new(),
             apps: Vec::new(),
@@ -471,8 +478,11 @@ impl PhoneApp {
             return;
         }
         self.selected = serial;
+        self.poll_inflight = false;
         self.contacts.clear();
         self.messages.clear();
+        self.message_selection.clear();
+        self.pending_message_delete = None;
         self.view_message = None;
         self.call_logs.clear();
         self.apps.clear();
@@ -485,6 +495,8 @@ impl PhoneApp {
     }
 
     fn apply_devices(&mut self, devices: Vec<Device>) {
+        self.extras.on_devices_changed(&devices);
+
         let still_present = self
             .selected
             .as_ref()
@@ -555,6 +567,20 @@ impl PhoneApp {
                 Response::Messages(messages) => {
                     self.set_status(format!("Loaded {} messages.", messages.len()), false);
                     self.messages = messages;
+                    self.message_selection.clear();
+                }
+                Response::DeletedMessages { ids } => {
+                    let count = ids.len();
+                    self.messages.retain(|message| !ids.contains(&message.id));
+                    self.message_selection.retain(|id| !ids.contains(id));
+                    if self
+                        .view_message
+                        .as_ref()
+                        .is_some_and(|message| ids.contains(&message.id))
+                    {
+                        self.view_message = None;
+                    }
+                    self.set_status(format!("Deleted {count} message(s) from the phone."), false);
                 }
                 Response::CallLogs(logs) => {
                     self.set_status(format!("Loaded {} call log(s).", logs.len()), false);
@@ -937,6 +963,51 @@ impl PhoneApp {
             })
             .collect();
 
+        let selected_count = self.message_selection.len();
+        let mut select_all_shown = false;
+        let mut clear_selection = false;
+        let mut delete_selected = false;
+        ui.horizontal(|ui| {
+            if ui.button("Select all shown").clicked() {
+                select_all_shown = true;
+            }
+            if ui
+                .add_enabled(selected_count > 0, egui::Button::new("Clear selection"))
+                .clicked()
+            {
+                clear_selection = true;
+            }
+            if ui
+                .add_enabled(
+                    selected_count > 0,
+                    egui::Button::new(
+                        RichText::new(format!("🗑 Delete selected ({selected_count})"))
+                            .color(ui.visuals().error_fg_color),
+                    ),
+                )
+                .on_hover_text("Delete the checked messages from the phone")
+                .clicked()
+            {
+                delete_selected = true;
+            }
+            if selected_count > 0 {
+                ui.weak(format!("{selected_count} selected"));
+            }
+        });
+        if select_all_shown {
+            self.message_selection
+                .extend(visible.iter().map(|message| message.id));
+        }
+        if clear_selection {
+            self.message_selection.clear();
+        }
+        if delete_selected {
+            self.pending_message_delete = Some(self.message_selection.iter().copied().collect());
+        }
+        ui.separator();
+
+        let selected = &self.message_selection;
+        let mut selection_changes: Vec<(i64, bool)> = Vec::new();
         let mut dial_number: Option<String> = None;
         let mut copy_number: Option<String> = None;
         let mut view_sms: Option<Sms> = None;
@@ -947,12 +1018,16 @@ impl PhoneApp {
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, false])
+            .column(Column::initial(28.0).at_least(24.0))
             .column(Column::initial(55.0).at_least(50.0))
             .column(Column::initial(140.0).at_least(110.0))
             .column(Column::initial(140.0).at_least(120.0))
             .column(Column::remainder().at_least(160.0).clip(true))
             .column(Column::initial(250.0).at_least(230.0))
             .header(26.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("");
+                });
                 header.col(|ui| {
                     ui.strong("Dir");
                 });
@@ -972,6 +1047,12 @@ impl PhoneApp {
             .body(|body| {
                 body.rows(ROW_HEIGHT, visible.len(), |mut row| {
                     let sms = visible[row.index()];
+                    row.col(|ui| {
+                        let mut checked = selected.contains(&sms.id);
+                        if ui.checkbox(&mut checked, "").changed() {
+                            selection_changes.push((sms.id, checked));
+                        }
+                    });
                     row.col(|ui| {
                         let (kind_color, kind_text) = match sms.kind {
                             SmsKind::Received => (Color32::LIGHT_GREEN, "IN"),
@@ -1030,6 +1111,14 @@ impl PhoneApp {
                     });
                 });
             });
+
+        for (id, checked) in selection_changes {
+            if checked {
+                self.message_selection.insert(id);
+            } else {
+                self.message_selection.remove(&id);
+            }
+        }
 
         if let Some(number) = dial_number {
             self.dial_input.clone_from(&number);
@@ -1111,6 +1200,49 @@ impl PhoneApp {
         if let Some(number) = dial_number {
             self.dial_input.clone_from(&number);
             self.submit(Request::Dial(number));
+        }
+    }
+
+    fn ui_message_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(ids) = self.pending_message_delete.clone() else {
+            return;
+        };
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        let modal = egui::Modal::new(egui::Id::new("message-delete-dialog")).show(ctx, |ui| {
+            ui.set_max_width(430.0);
+            ui.heading("Delete messages?");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "Delete {} selected message(s) from the phone?",
+                ids.len()
+            ));
+            ui.add_space(4.0);
+            ui.colored_label(ui.visuals().error_fg_color, "This cannot be undone.");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("🗑 Delete").color(ui.visuals().error_fg_color),
+                    ))
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+            });
+        });
+
+        if confirmed {
+            self.pending_message_delete = None;
+            self.set_status(format!("Deleting {} message(s)…", ids.len()), false);
+            self.submit(Request::DeleteMessages(ids));
+        } else if cancelled || modal.should_close() {
+            self.pending_message_delete = None;
         }
     }
 
@@ -1763,6 +1895,7 @@ impl eframe::App for PhoneApp {
 
         self.ui_uninstall_dialog(ctx);
         self.ui_message_dialog(ctx);
+        self.ui_message_delete_dialog(ctx);
         let selected = self.selected.clone();
         let ready = self.ready();
         let dev_ctx = DeviceCtx {
@@ -1771,6 +1904,10 @@ impl eframe::App for PhoneApp {
         };
         self.extras.ui_windows(ctx, &dev_ctx);
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.extras.shutdown();
+    }
 }
 
 fn app_icon() -> Option<egui::IconData> {
@@ -1778,6 +1915,13 @@ fn app_icon() -> Option<egui::IconData> {
         "../assets/icons/hicolor/256x256/apps/adb-phone-manager.png"
     ))
     .ok()
+}
+
+/// Whether winit will use the Wayland backend for this session.
+fn wayland_session() -> bool {
+    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
+        .into_iter()
+        .any(|key| std::env::var(key).is_ok_and(|value| !value.is_empty()))
 }
 
 fn main() -> eframe::Result {
@@ -1791,6 +1935,12 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport,
+        // On Wayland the compositor stops sending frame callbacks while the
+        // window is hidden or occluded. Waiting for vsync then blocks inside
+        // eglSwapBuffers, and the compositor marks the app as "not responding"
+        // until it becomes visible again. Rendering without waiting fixes that;
+        // keep vsync on X11 and the other platforms.
+        vsync: !wayland_session(),
         ..Default::default()
     };
     eframe::run_native(

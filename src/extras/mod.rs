@@ -11,7 +11,7 @@ mod windows;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -50,6 +50,9 @@ struct ManagedApp {
 }
 
 type Job = JobResult<Extras>;
+
+/// Grace period for scrcpy to clean up when the app shuts down.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 fn done(message: impl Into<String> + Send + 'static) -> Job {
     apply(move |extras: &mut Extras| extras.say(message, false))
@@ -95,6 +98,7 @@ pub struct Extras {
 
     // logcat
     log_stream: Option<LogStream>,
+    log_serial: Option<String>,
     log_buffer: LogBuffer,
     log_filter: String,
     log_level: Level,
@@ -147,6 +151,7 @@ impl Extras {
             info_auto: true,
             info_loaded_at: None,
             log_stream: None,
+            log_serial: None,
             log_buffer: LogBuffer::default(),
             log_filter: String::new(),
             log_level: Level::Verbose,
@@ -378,9 +383,66 @@ impl Extras {
     }
 }
 
-impl Drop for Extras {
-    fn drop(&mut self) {
+impl Extras {
+    /// Stops anything that is talking to a device which is no longer attached.
+    /// This keeps scrcpy from being left behind on a yanked USB cable and lets
+    /// it undo its phone-side changes instead of hanging the device.
+    pub fn on_devices_changed(&mut self, devices: &[crate::adb::Device]) {
+        let is_ready = |serial: &str| {
+            devices
+                .iter()
+                .any(|device| device.serial == serial && device.state == "device")
+        };
+
+        let mut stopped = Vec::new();
+        self.sessions.retain_mut(|session| {
+            let alive = session.serial().is_some_and(is_ready);
+            if !alive {
+                stopped.push(session.label().to_owned());
+                session.stop();
+            }
+            alive
+        });
+        if !stopped.is_empty() {
+            self.say(
+                format!(
+                    "Stopped {} because the device disconnected: {}.",
+                    if stopped.len() == 1 {
+                        "session".to_owned()
+                    } else {
+                        format!("{} sessions", stopped.len())
+                    },
+                    stopped.join(", ")
+                ),
+                true,
+            );
+        }
+
+        if self
+            .log_serial
+            .as_deref()
+            .is_some_and(|serial| !is_ready(serial))
+        {
+            self.log_stream = None;
+            self.log_serial = None;
+            self.say("Stopped logcat because the device disconnected.", true);
+        }
+    }
+
+    /// Gracefully stops every long-running child process before the app exits,
+    /// so scrcpy can restore the phone's settings.
+    pub fn shutdown(&mut self) {
+        for session in &mut self.sessions {
+            session.stop_and_wait(SHUTDOWN_GRACE);
+        }
         self.sessions.clear();
         self.log_stream = None;
+        self.log_serial = None;
+    }
+}
+
+impl Drop for Extras {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

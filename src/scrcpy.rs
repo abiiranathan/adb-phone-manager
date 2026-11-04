@@ -2,6 +2,8 @@
 
 use std::fmt;
 use std::process::{Child, Command};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -10,6 +12,10 @@ use crate::adb::AdbError;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Time scrcpy gets to shut down cleanly before it is killed outright.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(pub u32, pub u32);
@@ -171,8 +177,9 @@ pub struct SessionExit {
 }
 
 pub struct Session {
-    child: Child,
+    child: Option<Child>,
     label: String,
+    serial: Option<String>,
 }
 
 impl Session {
@@ -180,28 +187,83 @@ impl Session {
         &self.label
     }
 
+    pub fn serial(&self) -> Option<&str> {
+        self.serial.as_deref()
+    }
+
     pub fn poll(&mut self) -> Option<SessionExit> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => Some(SessionExit {
-                success: status.success(),
-                message: format!("exited with {status}"),
-            }),
+        let child = self.child.as_mut()?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.child = None;
+                Some(SessionExit {
+                    success: status.success(),
+                    message: format!("exited with {status}"),
+                })
+            }
             Ok(None) => None,
-            Err(e) => Some(SessionExit {
-                success: false,
-                message: e.to_string(),
-            }),
+            Err(e) => {
+                self.child = None;
+                Some(SessionExit {
+                    success: false,
+                    message: e.to_string(),
+                })
+            }
         }
     }
 
+    /// Asks scrcpy to quit gracefully (so it can undo its device-side setup)
+    /// and reaps it in the background, escalating to a hard kill if needed.
     pub fn stop(&mut self) {
-        let _ = self.child.kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        request_termination(&mut child);
+        thread::spawn(move || reap(&mut child, STOP_GRACE));
+    }
+
+    /// Like [`Session::stop`], but blocks until the process is gone. Used when
+    /// the app exits, where there is no later frame to reap the child from.
+    pub fn stop_and_wait(&mut self, grace: Duration) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        request_termination(&mut child);
+        reap(&mut child, grace);
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+fn request_termination(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SIGTERM lets SDL/scrcpy run its cleanup handlers. Killing a session
+        // abruptly leaves the phone in the state scrcpy set up for it.
+        let pid = child.id() as libc::pid_t;
+        if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+            return;
+        }
+    }
+    let _ = child.kill();
+}
+
+fn reap(child: &mut Child, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_POLL_INTERVAL),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
     }
 }
 
@@ -373,7 +435,8 @@ pub fn launch(opts: &Options, serial: Option<&str>) -> Result<Session, AdbError>
 
     let child = cmd.spawn().map_err(AdbError::Spawn)?;
     Ok(Session {
-        child,
+        child: Some(child),
         label: opts.mode.label().to_owned(),
+        serial: serial.map(str::to_owned),
     })
 }

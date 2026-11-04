@@ -29,6 +29,7 @@ impl Extras {
             if self.log_stream.is_some() {
                 if ui.button("⏹ Stop").clicked() {
                     self.log_stream = None;
+                    self.log_serial = None;
                 }
             } else if ui
                 .add_enabled(dev.ready, egui::Button::new("▶ Start"))
@@ -36,7 +37,10 @@ impl Extras {
             {
                 let adb = Adb::new(dev.serial.map(str::to_owned));
                 match logcat::start(&adb, self.ctx.clone()) {
-                    Ok(stream) => self.log_stream = Some(stream),
+                    Ok(stream) => {
+                        self.log_stream = Some(stream);
+                        self.log_serial = dev.serial.map(str::to_owned);
+                    }
                     Err(err) => self.say(err.to_string(), true),
                 }
             }

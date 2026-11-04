@@ -5,11 +5,12 @@ use std::error::Error;
 use std::fmt;
 use std::fmt::Write;
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process::{self, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -30,6 +31,15 @@ const KEYCODE_ENDCALL: u32 = 6;
 const KEYCODE_HEADSETHOOK: u32 = 79;
 
 const ANSWER_RETRY_DELAY: Duration = Duration::from_millis(700);
+
+/// How long a regular adb command may run before it is killed. Anything that
+/// moves data to or from the device gets [`TRANSFER_TIMEOUT`] instead.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const DEVICE_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const READER_GRACE: Duration = Duration::from_secs(2);
+const MAX_COMMAND_SUMMARY_LEN: usize = 120;
 
 const MAX_PACKAGE_LEN: usize = 255;
 const MAX_NUMBER_LEN: usize = 32;
@@ -57,6 +67,7 @@ pub enum AdbError {
     Failed(String),
     InvalidInput(String),
     Local(String),
+    Timeout(String),
 }
 
 impl fmt::Display for AdbError {
@@ -66,7 +77,7 @@ impl fmt::Display for AdbError {
                 f,
                 "cannot run `{ADB_PROGRAM}` (is it installed and on PATH?): {err}"
             ),
-            Self::Failed(msg) | Self::Local(msg) => write!(f, "{msg}"),
+            Self::Failed(msg) | Self::Local(msg) | Self::Timeout(msg) => write!(f, "{msg}"),
             Self::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
         }
     }
@@ -128,6 +139,8 @@ impl SmsKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sms {
+    /// Provider row id (`_id`), used to delete the message.
+    pub id: i64,
     pub address: String,
     pub date_ms: i64,
     pub kind: SmsKind,
@@ -459,15 +472,16 @@ impl Adb {
     pub fn messages(&self, limit: usize) -> Result<Vec<Sms>, AdbError> {
         let rows = self.content_query(
             SMS_URI,
-            &["address", "date", "type", "body"],
+            &["_id", "address", "date", "type", "body"],
             Some("date DESC"),
         )?;
         Ok(rows
             .into_iter()
             .take(limit)
             .filter_map(|row| {
-                let [address, date, kind, body] = <[String; 4]>::try_from(row).ok()?;
+                let [id, address, date, kind, body] = <[String; 5]>::try_from(row).ok()?;
                 Some(Sms {
+                    id: id.trim().parse().unwrap_or(0),
                     address,
                     date_ms: date.trim().parse().unwrap_or(0),
                     kind: SmsKind::from_type(&kind),
@@ -475,6 +489,27 @@ impl Adb {
                 })
             })
             .collect())
+    }
+
+    /// Deletes messages from the phone's SMS provider by their `_id`.
+    pub fn delete_messages(&self, ids: &[i64]) -> Result<(), AdbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let id_list = ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let where_clause = format!("_id IN ({id_list})");
+        let out = self.shell(&format!(
+            "content delete --uri {SMS_URI} --where {}",
+            shell_quote(&where_clause)
+        ))?;
+        if let Some(problem) = remote_failure(&out) {
+            return Err(AdbError::Failed(problem));
+        }
+        Ok(())
     }
 
     pub fn call_logs(&self, limit: usize) -> Result<Vec<CallRecord>, AdbError> {
@@ -670,15 +705,7 @@ impl Adb {
     }
 
     pub fn run(&self, args: &[&str]) -> Result<Captured, AdbError> {
-        let mut cmd = Command::new(resolve_program(ADB_PROGRAM)?);
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        if let Some(serial) = &self.serial {
-            cmd.arg("-s").arg(serial);
-        }
-        cmd.args(args);
-
-        let output = cmd.output().map_err(AdbError::Spawn)?;
+        let output = self.execute(args)?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
@@ -693,6 +720,17 @@ impl Adb {
     }
 
     pub fn run_raw(&self, args: &[&str]) -> Result<Vec<u8>, AdbError> {
+        let output = self.execute(args)?;
+        if !output.status.success() {
+            let msg = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(AdbError::Failed(msg));
+        }
+        Ok(output.stdout)
+    }
+
+    /// Runs adb with a deadline so a dead USB link cannot leave a background
+    /// job (and its worker thread) blocked forever.
+    fn execute(&self, args: &[&str]) -> Result<ProcessOutput, AdbError> {
         let mut cmd = Command::new(resolve_program(ADB_PROGRAM)?);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -701,13 +739,105 @@ impl Adb {
         }
         cmd.args(args);
 
-        let output = cmd.output().map_err(AdbError::Spawn)?;
-        if !output.status.success() {
-            let msg = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(AdbError::Failed(msg));
-        }
-        Ok(output.stdout)
+        run_with_timeout(cmd, args, timeout_for(args))
     }
+}
+
+struct ProcessOutput {
+    status: process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Long-running commands that stream data from or to the device.
+fn timeout_for(args: &[&str]) -> Duration {
+    match args.first().copied() {
+        Some("devices") => DEVICE_LIST_TIMEOUT,
+        Some("pull" | "push" | "install" | "install-multiple" | "uninstall") => TRANSFER_TIMEOUT,
+        _ => COMMAND_TIMEOUT,
+    }
+}
+
+fn run_with_timeout(
+    mut cmd: Command,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<ProcessOutput, AdbError> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(AdbError::Spawn)?;
+
+    // Drain the pipes on helper threads, but never join them: a stray child
+    // that inherited the pipe could otherwise keep this thread blocked forever.
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    if let Some(stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let _ = stdout_tx.send(read_all(stdout));
+        });
+    } else {
+        drop(stdout_tx);
+    }
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let _ = stderr_tx.send(read_all(stderr));
+        });
+    } else {
+        drop(stderr_tx);
+    }
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AdbError::Timeout(command_timeout_message(args, timeout)));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AdbError::Spawn(err));
+            }
+        }
+    };
+
+    // The process has exited, so at most one pipe buffer is still in flight.
+    let stdout = stdout_rx.recv_timeout(READER_GRACE).unwrap_or_default();
+    let stderr = stderr_rx.recv_timeout(READER_GRACE).unwrap_or_default();
+    Ok(ProcessOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_all(mut reader: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = reader.read_to_end(&mut bytes);
+    bytes
+}
+
+fn command_timeout_message(args: &[&str], timeout: Duration) -> String {
+    let mut command = args.join(" ");
+    if command.len() > MAX_COMMAND_SUMMARY_LEN {
+        let cut = command
+            .char_indices()
+            .take_while(|(index, _)| *index <= MAX_COMMAND_SUMMARY_LEN)
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(0);
+        command.truncate(cut);
+        command.push('…');
+    }
+    format!(
+        "`{ADB_PROGRAM} {command}` did not finish within {} second(s)",
+        timeout.as_secs()
+    )
 }
 
 fn remote_failure(out: &Captured) -> Option<String> {
@@ -1083,5 +1213,37 @@ fn validate_address(address: &str) -> Result<(), AdbError> {
         Err(AdbError::InvalidInput(format!(
             "bad device address {address:?}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn kills_commands_that_exceed_their_deadline() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 10"]);
+        let started = Instant::now();
+        let result = run_with_timeout(cmd, &["sh", "sleep 10"], Duration::from_millis(100));
+        assert!(matches!(result, Err(AdbError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn parses_message_ids_alongside_the_other_columns() {
+        let output = concat!(
+            "Row: 0 _id=42, address=+256700123456, date=1700000000000, ",
+            "type=1, body=Hello there\n",
+            "Row: 1 _id=43, address=+256700999999, date=1700000001000, ",
+            "type=2, body=Second message\n",
+        );
+        let keys = ["_id", "address", "date", "type", "body"];
+        let rows = parse_rows(output, &keys);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "42");
+        assert_eq!(rows[1][0], "43");
+        assert_eq!(rows[0][4], "Hello there");
     }
 }

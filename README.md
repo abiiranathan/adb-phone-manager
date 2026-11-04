@@ -7,6 +7,24 @@ operations run in the background so the interface remains responsive.
 
 ![Scrrenshot](./screenshot.png)
 
+## Download
+
+Prebuilt packages are published on the
+[releases page](https://github.com/abiiranathan/adb-phone-manager/releases):
+
+- **Linux:** an x86_64 `.AppImage` (make it executable and run it). AppImages
+  need FUSE 2 at runtime; on distributions that only ship FUSE 3, install
+  `libfuse2`/`fuse2` or run the AppImage with `--appimage-extract-and-run`.
+- **Windows:** an x86_64 `.msi` installer. It installs for all users and adds
+  Start menu and desktop shortcuts.
+- **macOS:** a universal `.dmg` for Apple silicon and Intel Macs. The build is
+  ad-hoc signed but not notarized, so Gatekeeper blocks it on first launch.
+  Open the app with **right-click → Open**, or allow it under **System Settings
+  → Privacy & Security**.
+
+All packages still need `adb` (Android SDK Platform-Tools) on `PATH`, and
+optionally `scrcpy` for mirroring.
+
 ## Features
 
 - **Calls:** view recent call history, place calls, answer ringing calls, and
@@ -195,6 +213,20 @@ Format Rust code with:
 ```sh
 cargo fmt
 ```
+
+### Releasing
+
+The release workflow in `.github/workflows/release.yml` builds the Linux
+AppImage, Windows MSI, and macOS DMG. Pushing a tag that matches the version in
+`Cargo.toml` publishes them to GitHub Releases:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow can also be started manually from the Actions tab; manual runs
+upload the packages as workflow artifacts without creating a release.
 
 ## License
 

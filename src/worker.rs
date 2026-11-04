@@ -26,6 +26,8 @@ pub enum Request {
     LoadContacts,
     /// Load up to `limit` SMS messages, newest first.
     LoadMessages { limit: usize },
+    /// Delete the SMS messages with the given provider ids.
+    DeleteMessages(Vec<i64>),
     /// Load up to `limit` call history entries.
     LoadCallLogs { limit: usize },
     /// Load installed packages.
@@ -73,6 +75,11 @@ pub enum Response {
     Contacts(Vec<Contact>),
     /// SMS messages, newest first.
     Messages(Vec<Sms>),
+    /// SMS messages that were deleted from the device.
+    DeletedMessages {
+        /// Provider ids that were deleted.
+        ids: Vec<i64>,
+    },
     /// Call log history entries.
     CallLogs(Vec<CallRecord>),
     /// Installed package names.
@@ -218,6 +225,9 @@ fn execute(serial: Option<String>, request: Request) -> Response {
         Request::Connect(address) => Adb::connect(&address).map(Response::Connected),
         Request::LoadContacts => adb.contacts().map(Response::Contacts),
         Request::LoadMessages { limit } => adb.messages(limit).map(Response::Messages),
+        Request::DeleteMessages(ids) => adb
+            .delete_messages(&ids)
+            .map(|()| Response::DeletedMessages { ids }),
         Request::LoadCallLogs { limit } => adb.call_logs(limit).map(Response::CallLogs),
         Request::LoadApps { third_party_only } => {
             adb.packages(third_party_only).map(Response::Apps)

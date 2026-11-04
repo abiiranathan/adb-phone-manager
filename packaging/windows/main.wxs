@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX Toolset v3 source for the ADB Phone Manager MSI.
+
+  Expected preprocessor variables (pass with candle.exe -dName=Value):
+    ProductVersion  Version number, for example 0.2.0
+    SourceDir       Directory containing adb-phone-manager.exe
+    IconPath        Full path to adb-phone-manager.ico
+    LicensePath     Full path to license.rtf
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+      Id="*"
+      Name="ADB Phone Manager"
+      Language="1033"
+      Version="$(var.ProductVersion)"
+      Manufacturer="ADB Phone Manager contributors"
+      UpgradeCode="b6c78821-2251-4e62-87c4-7b82fcabbc87">
+
+    <Package
+        InstallerVersion="500"
+        Compressed="yes"
+        InstallScope="perMachine"
+        Description="Browse and manage an Android phone over adb" />
+
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/abiiranathan/adb-phone-manager" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="ADB Phone Manager" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="ADB Phone Manager" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="ApplicationShortcutMenu" Guid="b13b7da3-42a1-45bc-a569-2d98f4e5251e">
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+            Root="HKLM"
+            Key="Software\ADB Phone Manager"
+            Name="StartMenuShortcut"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="f62cd1f7-7536-4f5a-a40d-6159e15638e1">
+        <File
+            Id="AdbPhoneManagerExe"
+            Name="adb-phone-manager.exe"
+            Source="$(var.SourceDir)\adb-phone-manager.exe"
+            KeyPath="yes">
+          <Shortcut
+              Id="StartMenuShortcut"
+              Directory="ApplicationProgramsFolder"
+              Name="ADB Phone Manager"
+              Description="Browse and manage an Android phone over adb"
+              WorkingDirectory="INSTALLFOLDER"
+              Icon="AppIcon"
+              Advertise="yes" />
+          <Shortcut
+              Id="DesktopShortcut"
+              Directory="DesktopFolder"
+              Name="ADB Phone Manager"
+              Description="Browse and manage an Android phone over adb"
+              WorkingDirectory="INSTALLFOLDER"
+              Icon="AppIcon"
+              Advertise="yes" />
+        </File>
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="ADB Phone Manager" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="ApplicationShortcutMenu" />
+    </Feature>
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicensePath)" />
+    <UIRef Id="WixUI_InstallDir" />
+  </Product>
+</Wix>

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Entry point for the ADB Phone Manager AppImage.
+set -eu
+
+here=$(dirname "$(readlink -f "$0")")
+
+export PATH="$here/usr/bin:${PATH:-}"
+export APPDIR="$here"
+
+exec "$here/usr/bin/adb-phone-manager" "$@"
