@@ -27,8 +27,8 @@
         DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <Icon Id="AppIcon" SourceFile="$(var.IconPath)" />
-    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Icon Id="AppIcon.exe" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.exe" />
     <Property Id="ARPHELPLINK" Value="https://github.com/abiiranathan/adb-phone-manager" />
     <Property Id="ARPNOREPAIR" Value="1" />
 
@@ -46,7 +46,7 @@
       <Component Id="ApplicationShortcutMenu" Guid="b13b7da3-42a1-45bc-a569-2d98f4e5251e">
         <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
         <RegistryValue
-            Root="HKLM"
+            Root="HKCU"
             Key="Software\ADB Phone Manager"
             Name="StartMenuShortcut"
             Type="integer"
@@ -68,7 +68,7 @@
               Name="ADB Phone Manager"
               Description="Browse and manage an Android phone over adb"
               WorkingDirectory="INSTALLFOLDER"
-              Icon="AppIcon"
+              Icon="AppIcon.exe"
               Advertise="yes" />
           <Shortcut
               Id="DesktopShortcut"
@@ -76,7 +76,7 @@
               Name="ADB Phone Manager"
               Description="Browse and manage an Android phone over adb"
               WorkingDirectory="INSTALLFOLDER"
-              Icon="AppIcon"
+              Icon="AppIcon.exe"
               Advertise="yes" />
         </File>
       </Component>
